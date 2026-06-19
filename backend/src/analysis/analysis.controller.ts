@@ -10,6 +10,7 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { AnalysisService } from './analysis.service';
 import { AnalyzeRequestDto, AnalyzeResponseDto } from './analysis.dto';
 import { PdfService } from '../pdf/pdf.service';
+import { memoryStorage } from 'multer';
 
 @Controller('analyze')
 export class AnalysisController {
@@ -18,7 +19,11 @@ export class AnalysisController {
     private readonly pdfService: PdfService,
   ) {}
   @Post()
-  @UseInterceptors(FileInterceptor('resume'))
+  @UseInterceptors(
+    FileInterceptor('resume', {
+      storage: memoryStorage(),
+    }),
+  )
   async analyze(
     @UploadedFile()
     file: {
@@ -30,6 +35,8 @@ export class AnalysisController {
 
     @Body() body: AnalyzeRequestDto,
   ): Promise<AnalyzeResponseDto> {
+    console.log('FILE RECEIVED:', file);
+    console.log('BODY RECEIVED:', body);
     if (!file) {
       throw new BadRequestException('Please upload a PDF resume file.');
     }
