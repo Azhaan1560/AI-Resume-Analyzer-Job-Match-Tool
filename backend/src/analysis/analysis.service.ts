@@ -1,6 +1,6 @@
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import axios from 'axios';
+import { GoogleGenAI } from '@google/genai';
 import { AnalyzeResponseDto } from './analysis.dto';
 
 interface ResumeData {
@@ -17,15 +17,16 @@ interface JobData {
   experienceNeeded: number;
 }
 
-interface OllamaResponse {
-  message: {
-    role: string;
-    content: string;
-  };
-}
 @Injectable()
 export class AnalysisService {
-  constructor(private readonly configService: ConfigService) {}
+  private readonly genAI: GoogleGenAI;
+
+  constructor(private readonly configService: ConfigService) {
+    this.genAI = new GoogleGenAI({
+      apiKey: this.configService.get<string>('GEMINI_API_KEY'),
+    });
+  }
+
   async analyzeResume(
     resumeText: string,
     jobDescription: string,
@@ -44,7 +45,7 @@ export class AnalysisService {
       jobDescription,
     );
 
-    //Build & Return the final response
+    // Build & return the final response
     return {
       matchScore: score,
       matchedSkills: matched,
@@ -56,62 +57,49 @@ export class AnalysisService {
     };
   }
 
-  //CALLING OLLAMA
-  private async callOllama(prompt: string): Promise<string> {
-    const ollamaUrl = this.configService.get<string>('OLLAMA_URL');
+  // ── GEMINI CALL ──────────────────────────────────────────────
+  // Drop-in replacement for the old Ollama call: same signature,
+  // same string return type, so the three callers don't change.
+  private async callGemini(prompt: string): Promise<string> {
+    const model =
+      this.configService.get<string>('GEMINI_MODEL') ?? 'gemini-2.5-flash';
 
-    const model = this.configService.get<string>('OLLAMA_MODEL');
-    console.log('OLLAMA_URL:', ollamaUrl);
-    console.log('OLLAMA_MODEL:', model);
     try {
-      const response = await axios.post(`${ollamaUrl}/api/chat`, {
+      const response = await this.genAI.models.generateContent({
         model,
-        messages: [
-          {
-            role: 'user',
-            content: prompt,
-          },
-        ],
-        stream: false,
-        options: {
-          num_ctx: 4096,
+        contents: prompt,
+        config: {
           temperature: 0,
+          // Force valid JSON — no markdown fences or preamble to strip.
+          responseMimeType: 'application/json',
         },
       });
-      const data = response.data as OllamaResponse;
-      // ← add this temporarily to see raw AI output
-      console.log('RAW AI RESPONSE:', data.message.content);
 
-      return data.message.content;
+      return response.text ?? '';
     } catch (error) {
       throw new InternalServerErrorException(
-        `Ollama call failed.. Is Ollama running? Error: ${error}`,
+        `Gemini call failed. Check your GEMINI_API_KEY. Error: ${error}`,
       );
     }
   }
 
-  // analysis.service.ts
-
+  // ── JSON PARSER (kept as a safety net) ───────────────────────
+  // With responseMimeType: 'application/json' Gemini returns clean
+  // JSON, but this still guards against the rare malformed response.
   private parseJson<T>(raw: string): T {
-    // Step 1 — strip markdown code blocks if AI wrapped JSON in ```json ... ```
     const stripped = raw
-      .replace(/```json/gi, '') // remove opening ```json
-      .replace(/```/g, '') // remove closing ```
+      .replace(/```json/gi, '')
+      .replace(/```/g, '')
       .trim();
 
-    // Step 2 — try parsing the whole cleaned string first
-    // This works when AI returns pure JSON with no extra text
     try {
       return JSON.parse(stripped) as T;
     } catch {
-      // Step 3 — if that fails, hunt for JSON object {...} in the string
-      // Using [\s\S]* instead of .* with /s flag — works on all Node versions
       const objectMatch = stripped.match(/\{[\s\S]*\}/);
       if (objectMatch?.[0]) {
         try {
           return JSON.parse(objectMatch[0]) as T;
         } catch {
-          // Step 4 — hunt for JSON array [...] instead
           const arrayMatch = stripped.match(/\[[\s\S]*\]/);
           if (arrayMatch?.[0]) {
             return JSON.parse(arrayMatch[0]) as T;
@@ -119,7 +107,6 @@ export class AnalysisService {
         }
       }
 
-      // Step 5 — hunt for array if object search was skipped
       const arrayMatch = stripped.match(/\[[\s\S]*\]/);
       if (arrayMatch?.[0]) {
         try {
@@ -129,11 +116,50 @@ export class AnalysisService {
         }
       }
 
-      // Nothing worked — throw a clear error
       throw new InternalServerErrorException(
         'AI returned unexpected format. Please try again.',
       );
     }
+  }
+
+  // ── SKILL MATCHING HELPERS ───────────────────────────────────
+  // lowercase + strip separators; keep + and # so C++ / C# survive
+  private normalizeSkill(skill: string): string {
+    return skill.toLowerCase().replace(/[\s._\-/]/g, '');
+  }
+
+  // synonyms that are NOT just version differences (extend as needed)
+  private static readonly SKILL_ALIASES: Record<string, string> = {
+    reactjs: 'react',
+    nodejs: 'node',
+    postgres: 'postgresql',
+    js: 'javascript',
+    ts: 'typescript',
+    k8s: 'kubernetes',
+    tf: 'tensorflow',
+    sklearn: 'scikitlearn',
+    scikit: 'scikitlearn',
+  };
+
+  private canonical(skill: string): string {
+    const n = this.normalizeSkill(skill);
+    return AnalysisService.SKILL_ALIASES[n] ?? n;
+  }
+
+  // does a resume skill satisfy a required job skill?
+  private skillsMatch(jobSkill: string, resumeSkill: string): boolean {
+    const j = this.canonical(jobSkill);
+    const r = this.canonical(resumeSkill);
+    if (!j || !r) return false;
+    if (j === r) return true;
+
+    // a trailing version token = same base skill:
+    // yolo↔yolov8 / yolov8n, vue↔vue3, python↔python3, resnet↔resnet50
+    const versionTail = /^v?\d+[a-z]*$/; // v8, v8n, 3, 11, 50 ...
+    if (r.startsWith(j) && versionTail.test(r.slice(j.length))) return true;
+    if (j.startsWith(r) && versionTail.test(j.slice(r.length))) return true;
+
+    return false;
   }
 
   private async extractResumeData(resumeText: string): Promise<ResumeData> {
@@ -154,7 +180,7 @@ export class AnalysisService {
             - Return EXACTLY these 4 fields and NO others: name, technicalSkills, softSkills, yearsExperience
             - name must be the candidate's actual full name from the resume, never empty
             - Do NOT include email, phone, address, or any other fields
-           
+
             Example of CORRECT output:
             {
               "name": "Jane Doe",
@@ -167,19 +193,19 @@ export class AnalysisService {
             {
               "technicalSkills": ["Experienced in Python and Java development for 3 years"]
             }
-              
+
             Resume: ${resumeText}
 
-            Return ONLY this JSON :
+            Return ONLY this JSON:
             {
-            "name": "full name or none",
-            "skills": ["skill1", "skill2", "skill3"],
-            "experienceYears": 0,
-            "currentTitle": "current or most recent job title"
+              "name": "full name or none",
+              "technicalSkills": ["skill1", "skill2", "skill3"],
+              "softSkills": ["skill1", "skill2"],
+              "yearsExperience": 0
             }
         `;
 
-    const raw = await this.callOllama(prompt);
+    const raw = await this.callGemini(prompt);
     return this.parseJson<ResumeData>(raw);
   }
 
@@ -187,21 +213,18 @@ export class AnalysisService {
     resumeData: ResumeData,
     jobData: JobData,
   ): { score: number; matched: string[]; missing: string[] } {
-    const technicalSkills = resumeData.technicalSkills ?? [];
-    const softSkills = resumeData.softSkills ?? [];
+    const resumeSkills = [
+      ...(resumeData.technicalSkills ?? []),
+      ...(resumeData.softSkills ?? []),
+    ];
     const requiredSkills = jobData.requiredSkills ?? [];
 
-    const resumeSkillsLower = new Set([
-      ...technicalSkills.map((s) => s.toLowerCase()),
-      ...softSkills.map((s) => s.toLowerCase()),
-    ]);
-
-    const matched = requiredSkills.filter((skill) =>
-      resumeSkillsLower.has(skill.toLowerCase()),
+    const matched = requiredSkills.filter((req) =>
+      resumeSkills.some((have) => this.skillsMatch(req, have)),
     );
 
     const missing = requiredSkills.filter(
-      (skill) => !resumeSkillsLower.has(skill.toLowerCase()),
+      (req) => !resumeSkills.some((have) => this.skillsMatch(req, have)),
     );
 
     const score =
@@ -226,18 +249,18 @@ export class AnalysisService {
     Return ONLY this EXACT JSON format:
     {
       "jobTitle": "title of the role",
-      "requiredSkills": ["skill1", "skill2", "skill3],
+      "requiredSkills": ["skill1", "skill2", "skill3"],
       "niceToHaveSkills": ["skill1", "skill2"],
       "experienceNeeded": 0
     }
-    
+
     Rules:
     - requiredSkills must be short individual skill names only (e.g. "Python", "OpenCV")
     - Do NOT write Python code, class definitions, or any programming language output
     - Return ONLY the JSON object shown above, filled with real data from the job posting
     `;
 
-    const raw = await this.callOllama(prompt);
+    const raw = await this.callGemini(prompt);
     return this.parseJson<JobData>(raw);
   }
 
@@ -250,22 +273,22 @@ export class AnalysisService {
   Rewrite the experience bullet points from the resume to better match the job.
   Return ONLY raw JSON.
   No explanation, no markdown, no code blocks, no extra text. Just the JSON object.
-  
-  Resume (first 1500 chatacters):
+
+  Resume (first 1500 characters):
   ${resumeText.slice(0, 1500)}
 
   Job Description (first 800 characters):
   ${jobDescription.slice(0, 800)}
   Rules:
-  -Use string action verbs (Led, Built, Designed, Reduced, Increased)
-  -Add quantifiable results where reasonable (e.g "by 30%)
-  -Stay honest - do not invent skills not in the resume
-  -Keep each bullet under 20 words
+  - Use strong action verbs (Led, Built, Designed, Reduced, Increased)
+  - Add quantifiable results where reasonable (e.g. "by 30%")
+  - Stay honest - do not invent skills not in the resume
+  - Keep each bullet under 20 words
 
   Return ONLY a JSON array of exactly 5 improved bullet point strings:
-  ["Bullet 1", "Bullet 2","Bullet 3","Bullet 4","Bullet 5"] `;
+  ["Bullet 1", "Bullet 2", "Bullet 3", "Bullet 4", "Bullet 5"]`;
 
-    const raw = await this.callOllama(prompt);
+    const raw = await this.callGemini(prompt);
     return this.parseJson<string[]>(raw);
   }
 }

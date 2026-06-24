@@ -1,3 +1,5 @@
+// NOTE: pdf-parse v2 (mehmet-kozan fork) uses a class-based API.
+// Do NOT refactor to `import pdfParse from 'pdf-parse'` — that is the v1 API.
 import { Injectable } from '@nestjs/common';
 import { PDFParse } from 'pdf-parse';
 
